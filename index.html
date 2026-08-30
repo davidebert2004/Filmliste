@@ -99,6 +99,9 @@
   .nojs{background:var(--card2); border:1px solid var(--line); border-left:4px solid var(--accent);
         border-radius:12px; padding:12px 16px; margin-bottom:18px; font-size:14px; color:var(--muted)}
   .nojs b{color:var(--text)}
+  .sync{font-size:12px; color:var(--muted); margin-top:6px; min-height:1.4em}
+  .sync.ok{color:var(--ok)}
+  .sync.err{color:var(--accent2)}
 </style>
 <noscript><style>
   /* Vorschau ohne JavaScript (z. B. Dateien-App am iPhone): nur lesbare Liste zeigen */
@@ -149,8 +152,10 @@
   <div class="foot">
     <a id="saveHtmlLink"><b>Als HTML speichern</b></a> — Datei mit allen Daten zum Verschicken<br>
     Alles lokal in deinem Browser gespeichert ·
-    <a id="exportLink">JSON-Backup</a> · <a id="importLink">Backup laden</a>
+    <a id="exportLink">JSON-Backup</a> · <a id="importLink">Backup laden</a><br>
+    <a id="syncNowLink">Jetzt abgleichen</a> · <a id="syncSetup">Schlüssel eintragen</a>
     <input type="file" id="fileIn" accept="application/json" hidden>
+    <div id="syncStatus" class="sync"></div>
     <div id="embedInfo"></div>
   </div>
 </div>
@@ -265,6 +270,11 @@ function build(list, type, startId){
 }
 function seedAll(){ const f=build(DEFAULT_FILMS,"film",1); return f.concat(build(DEFAULT_SERIES,"serie",f.length+1)); }
 function seedSeries(){ return build(DEFAULT_SERIES,"serie",0); }
+
+const TOKEN_KEY = "meineFilme_token_v1";
+const AT_KEY = "meineFilme_at_v1";
+let localAt = localStorage.getItem(AT_KEY) || "";   // Zeitstempel des lokalen Standes
+let booted = false;                                  // erst nach dem Start automatisch hochladen
 
 let films = load();
 let ownFilter="all", mediumFilter="all", query="";
@@ -388,7 +398,14 @@ function load(){
   normalize(a);   // Nachtrags-Blöcke oben liefern teils keine Wertung mit
   save(a); return a;
 }
-function save(a){ localStorage.setItem(STORE, JSON.stringify(a||films)); }
+function save(a){
+  localStorage.setItem(STORE, JSON.stringify(a||films));
+  if(booted){
+    localAt = new Date().toISOString();
+    localStorage.setItem(AT_KEY, localAt);
+    schedulePush();
+  }
+}
 
 const FSTORE="meineFilme_filters_v1";
 function saveFilters(){
@@ -594,6 +611,123 @@ document.getElementById("mSave").onclick=()=>{
   save(); overlay.classList.remove("show"); render(); updateStats();
 };
 
+// ---- Abgleich über GitHub: Mac und Handy teilen dieselbe Datei im Repository ----
+const SYNC = { owner:"davidebert2004", repo:"Filmliste", path:"daten.json", branch:"main" };
+const SYNC_API = "https://api.github.com/repos/"+SYNC.owner+"/"+SYNC.repo+"/contents/"+SYNC.path;
+const SYNC_RAW = "https://raw.githubusercontent.com/"+SYNC.owner+"/"+SYNC.repo+"/"+SYNC.branch+"/"+SYNC.path;
+let remoteSha=null, pushTimer=null, syncing=false, lastSync=0;
+const getToken = ()=>localStorage.getItem(TOKEN_KEY)||"";
+const uhr = ()=>new Date().toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"});
+
+// Base64 mit Umlauten korrekt hin und zurück
+function b64enc(str){
+  const b=new TextEncoder().encode(str); let bin="";
+  for(let i=0;i<b.length;i+=0x8000) bin+=String.fromCharCode.apply(null,b.subarray(i,i+0x8000));
+  return btoa(bin);
+}
+function b64dec(x){
+  const bin=atob(String(x).replace(/\s/g,"")); const b=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i);
+  return new TextDecoder().decode(b);
+}
+function setSync(msg,kind){
+  const el=document.getElementById("syncStatus");
+  if(el){ el.textContent=msg||""; el.className="sync"+(kind?" "+kind:""); }
+}
+
+async function pullRemote(){
+  const t=getToken(); let text;
+  if(t){                                    // mit Schlüssel: immer der frischeste Stand
+    const r=await fetch(SYNC_API+"?ref="+SYNC.branch+"&t="+Date.now(),
+      {cache:"no-store", headers:{Authorization:"Bearer "+t, Accept:"application/vnd.github+json"}});
+    if(r.status===404){ remoteSha=null; return null; }
+    if(!r.ok) throw new Error(fehlertext(r.status));
+    const d=await r.json(); remoteSha=d.sha; text=b64dec(d.content);
+  } else {                                  // ohne Schlüssel: nur lesen
+    const r=await fetch(SYNC_RAW+"?t="+Date.now(), {cache:"no-store"});
+    if(r.status===404) return null;
+    if(!r.ok) throw new Error(fehlertext(r.status));
+    text=await r.text();
+  }
+  const d=JSON.parse(text);
+  return (d && Array.isArray(d.films)) ? d : null;
+}
+function fehlertext(code){
+  if(code===401) return "Schlüssel ungültig";
+  if(code===403) return "keine Schreibrechte für das Repository";
+  if(code===404) return "Repository oder Datei nicht gefunden";
+  return "HTTP "+code;
+}
+function applyRemote(d){
+  films=normalize(d.films.map(x=>({...x})));
+  localAt=d.at||new Date().toISOString();
+  localStorage.setItem(STORE, JSON.stringify(films));
+  localStorage.setItem(AT_KEY, localAt);
+  buildGenres(); buildRatings(); render(); updateStats();
+}
+async function pushRemote(){
+  const t=getToken(); if(!t) return;
+  const send=()=>{
+    const body={ message:"Filmliste: "+films.length+" Titel", branch:SYNC.branch,
+                 content:b64enc(JSON.stringify({v:1, at:localAt, films:films})) };
+    if(remoteSha) body.sha=remoteSha;
+    return fetch(SYNC_API,{method:"PUT", body:JSON.stringify(body),
+      headers:{Authorization:"Bearer "+t, Accept:"application/vnd.github+json", "Content-Type":"application/json"}});
+  };
+  let r=await send();
+  if(r.status===409||r.status===422){        // Stand war veraltet: neu holen, dann entscheiden
+    const rem=await pullRemote();
+    if(rem && (rem.at||"") > localAt){ applyRemote(rem); return; }
+    r=await send();
+  }
+  if(!r.ok) throw new Error(fehlertext(r.status));
+  const d=await r.json(); remoteSha=d.content.sha;
+}
+async function syncNow(force){
+  if(syncing) return;
+  if(!force && Date.now()-lastSync < 5000) return;
+  syncing=true;
+  try{
+    setSync("gleicht ab …");
+    const rem=await pullRemote();
+    if(rem && (rem.at||"") > localAt){
+      applyRemote(rem);
+      setSync(getToken() ? "Stand vom anderen Gerät übernommen · "+uhr()
+                         : "aktuelle Liste geladen · "+uhr(), "ok");
+    } else if(getToken() && (!rem || (rem.at||"") < localAt)){
+      await pushRemote();
+      setSync("hochgeladen · "+uhr(),"ok");
+    } else {
+      setSync(getToken() ? "aktuell · "+uhr() : "Leseansicht – kein Schlüssel auf diesem Gerät", getToken()?"ok":"");
+    }
+  }catch(e){
+    setSync("Abgleich fehlgeschlagen: "+e.message,"err");
+  }finally{ syncing=false; lastSync=Date.now(); }
+}
+function schedulePush(){
+  if(!getToken()){ setSync("nur auf diesem Gerät gespeichert"); return; }
+  clearTimeout(pushTimer);
+  setSync("Änderung vorgemerkt …");
+  pushTimer=setTimeout(async ()=>{
+    if(syncing){ schedulePush(); return; }
+    syncing=true;
+    try{ setSync("speichert …"); await pushRemote(); setSync("hochgeladen · "+uhr(),"ok"); }
+    catch(e){ setSync("Hochladen fehlgeschlagen: "+e.message,"err"); }
+    finally{ syncing=false; lastSync=Date.now(); }
+  }, 1500);
+}
+function setupSync(){
+  const hat=!!getToken();
+  const t=prompt(hat
+    ? "GitHub-Schlüssel ersetzen.\nFeld leer lassen und OK drücken, um ihn von diesem Gerät zu entfernen."
+    : "GitHub-Zugriffsschlüssel einfügen (beginnt mit github_pat_ oder ghp_).\nEr wird nur auf diesem Gerät gespeichert.", "");
+  if(t===null) return;
+  const v=t.trim();
+  if(!v){ localStorage.removeItem(TOKEN_KEY); remoteSha=null; setSync("Schlüssel entfernt – nur noch Leseansicht"); return; }
+  localStorage.setItem(TOKEN_KEY, v);
+  syncNow(true);
+}
+
 // export / import / menu
 document.getElementById("exportLink").onclick=()=>{
   const blob=new Blob([JSON.stringify(films,null,2)],{type:"application/json"});
@@ -644,7 +778,7 @@ function exportHtml(){
   // Seite aufräumen und eine statische Liste einbacken. Die ist sichtbar, wenn kein
   // JavaScript läuft (iPhone-Dateivorschau); im Browser ersetzt render() sie sofort.
   overlay.classList.remove("show");
-  gc.innerHTML=""; rc.innerHTML="";
+  gc.innerHTML=""; rc.innerHTML=""; setSync("");
   grid.innerHTML = staticList();
   empty.style.display = films.length ? "none" : "block";
   // Statistik auf den Gesamtbestand setzen (ohne aktive Filter), da sie mit eingebacken wird
@@ -691,6 +825,13 @@ document.getElementById("search").value=query;
 setSegActive("ownFilter", ownFilter);
 setSegActive("mediumFilter", mediumFilter);
 buildGenres(); buildRatings(); render(); updateStats(); showEmbedInfo();
+
+booted = true;
+document.getElementById("syncSetup").onclick = setupSync;
+document.getElementById("syncNowLink").onclick = ()=>syncNow(true);
+syncNow(true);
+document.addEventListener("visibilitychange", ()=>{ if(!document.hidden) syncNow(false); });
+window.addEventListener("focus", ()=>syncNow(false));
 </script>
 </body>
 </html>
